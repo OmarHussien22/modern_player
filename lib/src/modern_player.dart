@@ -25,6 +25,7 @@ class ModernPlayer extends StatefulWidget {
       this.controlsOptions,
       this.themeOptions,
       this.translationOptions,
+      this.onPlayerCreated,
       this.callbackOptions});
 
   /// Video quality options for multiple qualities. If you have only one quality video just add one in list.
@@ -56,6 +57,8 @@ class ModernPlayer extends StatefulWidget {
   /// With [callbackOptions] option you can perform custom actions on callback.
   final ModernPlayerCallbackOptions? callbackOptions;
 
+  final void Function(VlcPlayerController controller)? onPlayerCreated;
+
   static Widget createPlayer(
       {required ModernPlayerVideo video,
       List<ModernPlayerSubtitleOptions>? subtitles,
@@ -65,6 +68,7 @@ class ModernPlayer extends StatefulWidget {
       ModernPlayerControlsOptions? controlsOptions,
       ModernPlayerThemeOptions? themeOptions,
       ModernPlayerTranslationOptions? translationOptions,
+      void Function(VlcPlayerController controller)? onPlayerCreated,
       ModernPlayerCallbackOptions? callbackOptions}) {
     return ModernPlayer._(
       video: video,
@@ -76,6 +80,7 @@ class ModernPlayer extends StatefulWidget {
       themeOptions: themeOptions,
       translationOptions: translationOptions,
       callbackOptions: callbackOptions,
+      onPlayerCreated: onPlayerCreated,
     );
   }
 
@@ -121,76 +126,123 @@ class _ModernPlayerState extends State<ModernPlayer> {
 
     // Network
     if (defaultSource.sourceType == ModernPlayerSourceType.network) {
-      _playerController = VlcPlayerController.network(defaultSource.source,
-          autoPlay: true,
-          autoInitialize: true,
-          hwAcc: HwAcc.auto,
-          options: VlcPlayerOptions(
-            subtitle: VlcSubtitleOptions(
-                [VlcSubtitleOptions.color(VlcSubtitleColor.white)]),
-          ));
+      _playerController = VlcPlayerController.network(
+        defaultSource.source,
+        autoPlay: true,
+        autoInitialize: true,
+        hwAcc: HwAcc.auto,
+        options: VlcPlayerOptions(
+          subtitle: VlcSubtitleOptions(
+            [VlcSubtitleOptions.color(VlcSubtitleColor.white)],
+          ),
+        ),
+      );
     }
     // File
     else if (defaultSource.sourceType == ModernPlayerSourceType.file) {
-      _playerController = VlcPlayerController.file(File(defaultSource.source),
-          autoPlay: true, autoInitialize: true, hwAcc: HwAcc.auto);
+      _playerController = VlcPlayerController.file(
+        File(defaultSource.source),
+        autoPlay: true,
+        autoInitialize: true,
+        hwAcc: HwAcc.auto,
+      );
     }
-    // Youtube
+    // Youtube  ✅ UPDATED
     else if (defaultSource.sourceType == ModernPlayerSourceType.youtube) {
-      var yt = YoutubeExplode();
+      final yt = YoutubeExplode();
       youtubeId = defaultSource.source;
-      StreamManifest manifest =
-          await yt.videos.streamsClient.getManifest(youtubeId);
+
+      StreamManifest manifest;
+
+      // Try with a preferred client set first (avoids decipher issues),
+      // then fall back to an alternate combo if needed.
+      try {
+        manifest = await yt.videos.streams.getManifest(
+          youtubeId!,
+          ytClients: [
+            YoutubeApiClient.ios,
+            YoutubeApiClient.androidVr,
+          ],
+        );
+      } catch (_) {
+        manifest = await yt.videos.streams.getManifest(
+          youtubeId!,
+          ytClients: [
+            YoutubeApiClient.android,
+            YoutubeApiClient.safari,
+          ],
+        );
+      }
 
       if (widget.video.fetchQualities ?? false) {
-        List<ModernPlayerVideoData> ytVideos = List.empty(growable: true);
+        // Build selectable quality list (video-only with a single best audio)
+        final List<ModernPlayerVideoData> ytVideos = [];
 
-        for (var element in manifest.videoOnly) {
-          ModernPlayerVideoData videoData =
-              ModernPlayerVideoDataYoutube.network(
-                  label: element.qualityLabel,
-                  url: element.url.toString(),
-                  audioOverride:
-                      manifest.audioOnly.withHighestBitrate().url.toString());
+        // optional: ensure highest-to-lowest by bitrate/quality label
+        final videoOnlySorted = manifest.videoOnly.toList()
+          ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
 
-          if (ytVideos
-              .where((element) => element.label == videoData.label)
-              .isEmpty) {
-            ytVideos.insert(0, videoData);
+        final String bestAudioUrl =
+            manifest.audioOnly.withHighestBitrate().url.toString();
+
+        for (final v in videoOnlySorted) {
+          final item = ModernPlayerVideoDataYoutube.network(
+            label: v.qualityLabel,
+            url: v.url.toString(),
+            audioOverride: bestAudioUrl,
+          );
+
+          // keep unique quality labels
+          final exists = ytVideos.any((e) => e.label == item.label);
+          if (!exists) {
+            ytVideos.add(item);
           }
         }
 
         videosData = ytVideos;
 
-        widget.audioTracks.add(ModernPlayerAudioTrackOptions(
-            source: manifest.audioOnly.withHighestBitrate().url.toString(),
-            sourceType: ModernPlayerAudioSourceType.network));
+        // expose best audio as extra audio track (keeps your UI behavior)
+        widget.audioTracks.add(
+          ModernPlayerAudioTrackOptions(
+            source: bestAudioUrl,
+            sourceType: ModernPlayerAudioSourceType.network,
+          ),
+        );
 
-        ModernPlayerVideoData? defaultSourceYt = _getDefaultTrackSource(
-            selectors: widget.defaultSelectionOptions?.defaultQualitySelectors,
-            trackEntries: ytVideos);
+        final ModernPlayerVideoData? defaultSourceYt = _getDefaultTrackSource(
+          selectors: widget.defaultSelectionOptions?.defaultQualitySelectors,
+          trackEntries: ytVideos,
+        );
 
         selectedQuality = defaultSourceYt ?? defaultSource;
 
         _playerController = VlcPlayerController.network(
-            defaultSourceYt?.source ?? ytVideos.first.source,
-            autoPlay: true,
-            autoInitialize: true,
-            hwAcc: HwAcc.auto);
+          (defaultSourceYt ?? ytVideos.first).source,
+          autoPlay: true,
+          autoInitialize: true,
+          hwAcc: HwAcc.auto,
+        );
       } else {
+        // Simple mode: pick the best muxed stream (video+audio)
+        final muxed = manifest.muxed.withHighestBitrate();
         _playerController = VlcPlayerController.network(
-            manifest.muxed.withHighestBitrate().url.toString(),
-            autoPlay: true,
-            autoInitialize: true,
-            hwAcc: HwAcc.auto);
+          muxed.url.toString(),
+          autoPlay: true,
+          autoInitialize: true,
+          hwAcc: HwAcc.auto,
+        );
       }
 
       yt.close();
     }
     // Asset
     else {
-      _playerController = VlcPlayerController.asset(defaultSource.source,
-          autoPlay: true, autoInitialize: true, hwAcc: HwAcc.full);
+      _playerController = VlcPlayerController.asset(
+        defaultSource.source,
+        autoPlay: true,
+        autoInitialize: true,
+        hwAcc: HwAcc.full,
+      );
     }
 
     _playerController.addOnInitListener(_onInitialize);
@@ -199,6 +251,7 @@ class _ModernPlayerState extends State<ModernPlayer> {
     setState(() {
       canDisplayVideo = true;
     });
+    widget.onPlayerCreated?.call(_playerController);
   }
 
   /// Helper function to set default track for subtitle, audio, etc
